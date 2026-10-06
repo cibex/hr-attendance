@@ -27,6 +27,7 @@ class HrAttendanceTheoreticalTimeReport(models.Model):
         readonly=True,
     )
     date = fields.Date(readonly=True)
+    leave_hours = fields.Float(string="Leave", readonly=True)
     worked_hours = fields.Float(string="Worked", readonly=True)
     theoretical_hours = fields.Float(string="Theoric", readonly=True)
     difference = fields.Float(readonly=True)
@@ -40,9 +41,10 @@ class HrAttendanceTheoreticalTimeReport(models.Model):
             employee_id,
             department_id,
             date,
+            max(leave_hours) AS leave_hours,
             sum(worked_hours) AS worked_hours,
             max(theoretical_hours) AS theoretical_hours,
-            sum(difference) AS difference
+            sum(worked_hours) - max(theoretical_hours) AS difference
             """
 
     def _select_sub1(self):
@@ -50,15 +52,13 @@ class HrAttendanceTheoreticalTimeReport(models.Model):
         # this MD5 hash converted to integer. See
         # https://stackoverflow.com/a/9812029 for details.
         return """
-            (
-                ('x'||substr(MD5('HA' || ha.id::text), 1, 8))::bit(32)::int
-            ) AS id,
+            ha.id AS id,
             ha.employee_id AS employee_id,
             hahe.department_id AS department_id,
             ha.check_in::date AS date,
-            ha.worked_hours AS worked_hours,
-            ha.theoretical_hours AS theoretical_hours,
-            0.0 AS difference
+            ha.leave_hours AS leave_hours,
+            CASE WHEN ha.active THEN ha.worked_hours ELSE 0 END AS worked_hours,
+            ha.theoretical_hours AS theoretical_hours
             """
 
     def _from_sub1(self):
@@ -69,68 +69,6 @@ class HrAttendanceTheoreticalTimeReport(models.Model):
 
     def _where_sub1(self):
         return "True"
-
-    def _select_sub2(self):
-        # Same comment about ID uniqueness of sub1.
-        return """
-            (
-                ('x'||substr(MD5(
-                    'HE' || he.id::text || gs::text
-                ), 1, 8))::bit(32)::int
-            ) AS id,
-            he.id AS employee_id,
-            he.department_id AS department_id,
-            gs::date AS date,
-            0 AS worked_hours,
-            -1 AS theoretical_hours,
-            0.0 AS difference
-            """
-
-    def _from_sub2(self):
-        # We generate one record for each of the theoretical working days
-        # since the employee creation / working schedule beginning for not
-        # depending on the registered attendances.
-        return """
-                hr_employee he
-            INNER JOIN
-                resource_resource rr ON he.resource_id = rr.id
-            LEFT JOIN
-                resource_calendar_attendance rca
-                    ON rca.calendar_id = rr.calendar_id
-            CROSS JOIN
-                generate_series(
-                    greatest(
-                        COALESCE(he.theoretical_hours_start_date,
-                                 he.create_date::date),
-                        COALESCE(rca.date_from,
-                                 he.theoretical_hours_start_date,
-                                 he.create_date::date)
-                    )
-                    + (8 + rca.dayofweek::int -
-                        extract(dow from greatest(
-                            COALESCE(he.theoretical_hours_start_date,
-                                     he.create_date::date),
-                            COALESCE(rca.date_from,
-                                     he.theoretical_hours_start_date,
-                                     he.create_date::date)
-                        ))::int) % 7,
-                    least(
-                        COALESCE(rca.date_to, current_date),
-                        current_date
-                    )
-                    + (-6 + rca.dayofweek::int -
-                        extract(dow from least(
-                            COALESCE(rca.date_to, current_date),
-                            current_date
-                        ))::int) % 7,
-                    '7 days'
-                ) AS gs
-            """
-
-    def _where_sub2(self):
-        return """
-            rca.id IS NOT NULL
-            """
 
     def _group_by(self):
         return """
@@ -151,11 +89,6 @@ CREATE or REPLACE VIEW %s as (
             FROM %s
             WHERE %s
         )
-        UNION (
-            SELECT %s
-            FROM %s
-            WHERE %s
-        )
     ) AS u
     GROUP BY %s
 )
@@ -166,9 +99,6 @@ CREATE or REPLACE VIEW %s as (
                 AsIs(self._select_sub1()),
                 AsIs(self._from_sub1()),
                 AsIs(self._where_sub1()),
-                AsIs(self._select_sub2()),
-                AsIs(self._from_sub2()),
-                AsIs(self._where_sub2()),
                 AsIs(self._group_by()),
             ),
         )
@@ -199,49 +129,32 @@ CREATE or REPLACE VIEW %s as (
         return res[employee.id]["hours"]
 
     @api.model
-    def read_group(
-        self, domain, fields, groupby, offset=0, limit=None, orderby=False, lazy=True
-    ):
-        """Compute dynamically theoretical hours amount, computing on the fly
-        theoretical hours for non existing attendances with stored hours.
-        This technique has proven to be more efficient than trying to call
-        recursively `read_group` grouping by date and employee.
-        """
-        res = super().read_group(
-            domain,
-            fields,
-            groupby,
-            offset=offset,
-            limit=limit,
-            orderby=orderby,
-            lazy=lazy,
+    def _leave_hours(self, employee, date):
+        if not employee.resource_id.calendar_id:
+            return 0
+        tz = employee.resource_id.calendar_id.tz
+        from_datetime = datetime.combine(
+            date, time(0, 0, 0, 0, tzinfo=pytz.timezone(tz))
         )
-
-        if "theoretical_hours:sum" not in fields:
-            return res
-
-        full_fields = all(
-            x in fields
-            for x in {"theoretical_hours:sum", "worked_hours:sum", "difference:sum"}
+        to_datetime = datetime.combine(
+            date, time(23, 59, 59, 99999, tzinfo=pytz.timezone(tz))
         )
-        difference_field = "difference:sum" in fields
-        for line in res:
-            day_dict = {}
-            records = self.search(line.get("__domain", domain))
-            for record in records:
-                key = (record.employee_id.id, record.date)
-                if key not in day_dict:
-                    if record.theoretical_hours < 0:
-                        day_dict[key] = self._theoretical_hours(
-                            record.employee_id.sudo(), record.date
-                        )
-                    else:
-                        day_dict[key] = record.theoretical_hours
-            line["theoretical_hours"] = sum(day_dict.values())
-            if full_fields:  # compute difference
-                line["difference"] = (line["worked_hours"] or 0.0) - line[
-                    "theoretical_hours"
-                ]
-            elif difference_field:  # Remove wrong 0 values
-                del line["difference"]
-        return res
+        data1 = employee._get_work_days_data_batch(
+            from_datetime, to_datetime, compute_leaves=False
+        )
+        data2 = employee._get_work_days_data_batch(
+            from_datetime,
+            to_datetime,
+            compute_leaves=True,
+            # Pass this domain for excluding leaves whose type
+            domain=[
+                "|",
+                ("holiday_id", "=", False),
+                (
+                    "holiday_id.holiday_status_id.include_in_leave_theoretical",
+                    "=",
+                    False,
+                ),
+            ],
+        )
+        return data1[employee.id]["hours"] - data2[employee.id]["hours"]

@@ -12,6 +12,7 @@ class RecomputeTheoreticalAttendance(models.TransientModel):
         required=True,
         string="Employees",
         help="Recompute these employees attendances",
+        context={"active_test": False},
     )
     date_from = fields.Datetime(
         string="From", required=True, help="Recompute attendances from this date"
@@ -24,15 +25,24 @@ class RecomputeTheoreticalAttendance(models.TransientModel):
         """This method allows other modules to extend it to perform other actions
         and/or execute other methods compute from the corresponding attendances."""
         attendances._compute_theoretical_hours()
+        attendances._compute_leave_hours()
 
     def action_recompute(self):
         self.ensure_one()
-        attendances = self.env["hr.attendance"].search(
-            [
-                ("employee_id", "in", self.employee_ids.ids),
-                ("check_in", ">=", self.date_from),
-                ("check_out", "<=", self.date_to),
-            ]
+        for employee in self.employee_ids:
+            employee._action_create_empty_attendance(
+                self.date_from.date(), self.date_to.date()
+            )
+        attendances = (
+            self.env["hr.attendance"]
+            .with_context(active_test=False)
+            .search(
+                [
+                    ("employee_id", "in", self.employee_ids.ids),
+                    ("check_in", ">=", self.date_from),
+                    ("check_out", "<=", self.date_to),
+                ]
+            )
         )
         self._action_recompute(attendances)
         return {"type": "ir.actions.act_window_close"}
